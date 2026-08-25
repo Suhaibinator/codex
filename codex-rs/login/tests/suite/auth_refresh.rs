@@ -260,6 +260,101 @@ async fn refresh_token_succeeds_updates_storage() -> Result<()> {
 
 #[serial_test::serial(auth_env)]
 #[tokio::test]
+async fn refresh_token_if_stale_skips_authority_when_access_token_is_fresh() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "new-access-token",
+            "refresh_token": "new-refresh-token"
+        })))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let ctx = RefreshTokenTestContext::new(&server).await?;
+    let fresh_access_token = access_token_with_expiration(Utc::now() + Duration::hours(1));
+    let initial_auth = AuthDotJson {
+        auth_mode: Some(AuthMode::Chatgpt),
+        openai_api_key: None,
+        tokens: Some(build_tokens(&fresh_access_token, INITIAL_REFRESH_TOKEN)),
+        last_refresh: Some(Utc::now()),
+        agent_identity: None,
+        personal_access_token: None,
+        bedrock_api_key: None,
+        bedrock_access_keys: None,
+    };
+    ctx.write_auth(&initial_auth).await?;
+
+    // Repeated forced refreshes must not rotate a token that is nowhere near expiry.
+    ctx.auth_manager
+        .refresh_token_if_stale()
+        .await
+        .context("first refresh_token_if_stale should succeed")?;
+    ctx.auth_manager
+        .refresh_token_if_stale()
+        .await
+        .context("second refresh_token_if_stale should succeed")?;
+
+    assert_eq!(ctx.load_auth()?, initial_auth);
+    server.verify().await;
+    Ok(())
+}
+
+#[serial_test::serial(auth_env)]
+#[tokio::test]
+async fn refresh_token_if_stale_refreshes_when_access_token_is_near_expiry() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "new-access-token",
+            "refresh_token": "new-refresh-token"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let ctx = RefreshTokenTestContext::new(&server).await?;
+    let expiring_access_token = access_token_with_expiration(Utc::now() + Duration::minutes(1));
+    let initial_tokens = build_tokens(&expiring_access_token, INITIAL_REFRESH_TOKEN);
+    let initial_auth = AuthDotJson {
+        auth_mode: Some(AuthMode::Chatgpt),
+        openai_api_key: None,
+        tokens: Some(initial_tokens.clone()),
+        last_refresh: Some(Utc::now()),
+        agent_identity: None,
+        personal_access_token: None,
+        bedrock_api_key: None,
+        bedrock_access_keys: None,
+    };
+    ctx.write_auth(&initial_auth).await?;
+
+    ctx.auth_manager
+        .refresh_token_if_stale()
+        .await
+        .context("refresh_token_if_stale should refresh a near-expiry token")?;
+
+    let stored = ctx.load_auth()?;
+    let tokens = stored.tokens.as_ref().context("tokens should exist")?;
+    assert_eq!(
+        tokens,
+        &TokenData {
+            access_token: "new-access-token".to_string(),
+            refresh_token: "new-refresh-token".to_string(),
+            ..initial_tokens
+        }
+    );
+    server.verify().await;
+    Ok(())
+}
+
+#[serial_test::serial(auth_env)]
+#[tokio::test]
 async fn refresh_token_refreshes_when_auth_is_unchanged() -> Result<()> {
     skip_if_no_network!(Ok(()));
 

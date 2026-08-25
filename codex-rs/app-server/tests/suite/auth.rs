@@ -324,6 +324,72 @@ async fn get_auth_status_with_api_key_refresh_requested() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_auth_status_with_fresh_chatgpt_token_skips_forced_refresh() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path())?;
+    write_chatgpt_auth(
+        codex_home.path(),
+        ChatGptAuthFixture::new("fresh-access-token")
+            .refresh_token("fresh-refresh-token")
+            .account_id("acct_123")
+            .email("user@example.com")
+            .plan_type("pro")
+            .last_refresh(Some(Utc::now())),
+        AuthCredentialsStoreMode::File,
+    )?;
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+            "error": {
+                "code": "refresh_token_invalidated"
+            }
+        })))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let refresh_url = format!("{}/oauth/token", server.uri());
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .with_env_overrides(&[
+            ("OPENAI_API_KEY", None),
+            (
+                REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR,
+                Some(refresh_url.as_str()),
+            ),
+        ])
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
+
+    // A client that forces a refresh on every poll must not rotate a fresh token.
+    for _ in 0..2 {
+        let request_id = mcp
+            .send_get_auth_status_request(GetAuthStatusParams {
+                include_token: Some(true),
+                refresh_token: Some(true),
+            })
+            .await?;
+
+        let status: GetAuthStatusResponse =
+            timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
+        assert_eq!(
+            status,
+            GetAuthStatusResponse {
+                auth_method: Some(AuthMode::Chatgpt),
+                auth_token: Some("fresh-access-token".to_string()),
+                requires_openai_auth: Some(true),
+            }
+        );
+    }
+
+    server.verify().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_auth_status_omits_token_after_permanent_refresh_failure() -> Result<()> {
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path())?;
@@ -333,7 +399,8 @@ async fn get_auth_status_omits_token_after_permanent_refresh_failure() -> Result
             .refresh_token("stale-refresh-token")
             .account_id("acct_123")
             .email("user@example.com")
-            .plan_type("pro"),
+            .plan_type("pro")
+            .last_refresh(Some(Utc::now() - Duration::days(9))),
         AuthCredentialsStoreMode::File,
     )?;
 
@@ -345,7 +412,7 @@ async fn get_auth_status_omits_token_after_permanent_refresh_failure() -> Result
                 "code": "refresh_token_reused"
             }
         })))
-        .expect(1)
+        .expect(1..=2)
         .mount(&server)
         .await;
 

@@ -2801,6 +2801,20 @@ impl AuthManager {
         }
     }
 
+    /// Like [`Self::refresh_token`], but a no-op while the cached ChatGPT
+    /// access token is not near expiry. Clients that request a refresh on
+    /// every status poll would otherwise rotate the refresh token needlessly,
+    /// and every rotation is a chance for the authority to reject it.
+    pub async fn refresh_token_if_stale(&self) -> Result<(), RefreshTokenError> {
+        if let Some(auth @ CodexAuth::Chatgpt(_)) = self.auth_cached().as_ref()
+            && !Self::should_refresh_proactively(auth)
+        {
+            tracing::info!("Skipping token refresh because the access token is not near expiry.");
+            return Ok(());
+        }
+        self.refresh_token().await
+    }
+
     /// Attempt to refresh the current auth token from the authority that issued
     /// it and update the shared cache. If the token refresh fails, returns the
     /// error to the caller.
