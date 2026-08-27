@@ -31,7 +31,6 @@ use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TurnEnvironmentSelections;
-use codex_protocol::security_risk::SecurityRiskScore;
 use codex_skills::SkillError;
 use std::sync::OnceLock;
 use tokio::sync::Semaphore;
@@ -69,6 +68,7 @@ pub(crate) struct Session {
     pub(crate) services: SessionServices,
     pub(super) git_enrichment_policy: GitEnrichmentPolicy,
     pub(super) fork_persistence: ForkPersistence,
+    pub(super) forked_from_ordinal_exclusive: Option<u64>,
     pub(super) next_internal_sub_id: AtomicU64,
 }
 
@@ -143,6 +143,7 @@ impl SessionConfiguration {
     pub(super) fn inferred_environment_config(&self) -> EnvironmentConfig {
         EnvironmentConfig {
             allow_login_shell: self.allow_login_shell,
+            workspace_roots: Vec::new(),
             permission_profile: self.permission_profile_state.snapshot(),
             shell_environment_policy: self.shell_environment_policy.clone(),
             windows_sandbox_level: self.windows_sandbox_level,
@@ -166,6 +167,21 @@ impl SessionConfiguration {
         let workspace_roots = ThreadEnvironments::primary_workspace_roots_for(environments);
         self.permission_profile()
             .materialize_project_roots_with_workspace_roots(&workspace_roots)
+    }
+
+    fn effective_permission_profile(
+        &self,
+        environments: &[TurnEnvironmentSelection],
+    ) -> PermissionProfile {
+        ThreadEnvironments::primary_config_for(environments)
+            .map(|config| {
+                config
+                    .permission_profile
+                    .permission_profile()
+                    .clone()
+                    .materialize_project_roots_with_path_uris(&config.workspace_roots)
+            })
+            .unwrap_or_else(|| self.materialized_permission_profile(environments))
     }
 
     pub(super) fn active_permission_profile(&self) -> Option<ActivePermissionProfile> {
@@ -228,10 +244,7 @@ impl SessionConfiguration {
             service_tier: self.step_settings.service_tier.clone(),
             approval_policy: self.step_settings.approval_policy.value(),
             approvals_reviewer: self.step_settings.approvals_reviewer,
-            permission_profile: permission_profile
-                .permission_profile()
-                .clone()
-                .materialize_project_roots_with_workspace_roots(&workspace_roots),
+            permission_profile: self.effective_permission_profile(&environment_selections),
             active_permission_profile: permission_profile.active_permission_profile(),
             environments: TurnEnvironmentSelections::new(
                 self.legacy_fallback_cwd.clone(),
@@ -293,13 +306,11 @@ impl SessionConfiguration {
             approvals_reviewer: Some(self.step_settings.approvals_reviewer),
             permission_profile: Some(self.permission_profile()),
             active_permission_profile: self.active_permission_profile(),
+            windows_sandbox_level: Some(self.windows_sandbox_level),
             summary: self.step_settings.reasoning_summary,
             service_tier: Some(self.step_settings.service_tier.clone()),
             collaboration_mode: Some(self.step_settings.collaboration_mode.clone()),
             personality: self.step_settings.personality,
-            // TODO(anp): Include the runtime Windows sandbox override in restored settings.
-            // This omission predates TurnEnvironment::sandbox_context; rebuilding FromThread
-            // environments falls back to Config instead of retaining that override.
             ..Default::default()
         }
     }
@@ -317,13 +328,7 @@ impl SessionConfiguration {
         &self,
         environments: &[TurnEnvironmentSelection],
     ) -> StepSettingsConstraints<'_> {
-        let permission_profile = ThreadEnvironments::primary_config_for(environments)
-            .map(|config| config.permission_profile.permission_profile())
-            .unwrap_or_else(|| self.permission_profile_state.permission_profile())
-            .clone()
-            .materialize_project_roots_with_workspace_roots(
-                &ThreadEnvironments::primary_workspace_roots_for(environments),
-            );
+        let permission_profile = self.effective_permission_profile(environments);
         StepSettingsConstraints {
             requirements: self
                 .original_config_do_not_use
@@ -595,14 +600,19 @@ impl Session {
         turn_context: &TurnContext,
         request_kind: CodexResponsesRequestKind,
     ) -> CodexResponsesMetadata {
-        let (window_id, context_window_id) = self.current_window().await;
+        let (window_id, window_number, context_window_id) = self.current_window().await;
+        let responses_metadata = turn_context.turn_metadata_state.to_responses_metadata(
+            self.installation_id.clone(),
+            window_id,
+            request_kind,
+        );
         CodexResponsesMetadata {
+            window_number: Some(window_number),
             context_window_id: Some(context_window_id),
-            ..turn_context.turn_metadata_state.to_responses_metadata(
-                self.installation_id.clone(),
-                window_id,
-                request_kind,
-            )
+            forked_from_ordinal_exclusive: self
+                .forked_from_ordinal_exclusive
+                .filter(|_| responses_metadata.forked_from_thread_id.is_some()),
+            ..responses_metadata
         }
     }
 
@@ -612,7 +622,7 @@ impl Session {
         mut session_configuration: SessionConfiguration,
         environment_selections: &[TurnEnvironmentSelection],
         config: Arc<Config>,
-        user_instructions: Option<codex_extension_api::UserInstructions>,
+        user_instructions: Option<codex_extension_api::Instructions>,
         installation_id: String,
         auth_manager: Arc<AuthManager>,
         models_manager: SharedModelsManager,
@@ -676,6 +686,31 @@ impl Session {
             .forked_from_thread_id
             .or_else(|| initial_history.forked_from_id());
         session_configuration.forked_from_thread_id = forked_from_id;
+        let forked_from_ordinal_exclusive = match &fork_persistence {
+            ForkPersistence::Referenced { history_base, .. } => {
+                history_base.map(|position| position.end_ordinal_exclusive)
+            }
+            ForkPersistence::Copied => match &initial_history {
+                InitialHistory::Resumed(resumed) => {
+                    // Both local and CCA thread stores place the resumed thread's
+                    // canonical SessionMeta first. Never inspect inherited metadata:
+                    // an ancestor's history_base describes a different fork boundary.
+                    resumed.history.first().and_then(|item| match item {
+                        RolloutItem::SessionMeta(meta)
+                            if meta.meta.id == resumed.conversation_id =>
+                        {
+                            codex_rollout::forked_from_ordinal_exclusive(
+                                &meta.meta,
+                                resumed.rollout_path.as_deref(),
+                            )
+                        }
+                        _ => None,
+                    })
+                }
+                InitialHistory::New | InitialHistory::Cleared | InitialHistory::Forked(_) => None,
+            },
+        }
+        .filter(|_| forked_from_id.is_some());
         let parent_thread_id = session_configuration
             .parent_thread_id
             .or_else(|| initial_history.get_resumed_parent_thread_id());
@@ -754,18 +789,6 @@ impl Session {
             config.current_time_reminder.as_ref(),
             external_time_provider,
         )?;
-        if thread_extension_init.get::<SecurityRiskScore>().is_none()
-            && let Some(score) = initial_history
-                .get_rollout_items()
-                .iter()
-                .rev()
-                .find_map(|item| match item {
-                    RolloutItem::SecurityRiskScore(score) => Some(score),
-                    _ => None,
-                })
-        {
-            thread_extension_init.insert(score.clone());
-        }
         let selected_capability_roots =
             match thread_extension_init.get::<Vec<SelectedCapabilityRoot>>() {
                 Some(roots) => roots.as_ref().clone(),
@@ -1398,6 +1421,7 @@ impl Session {
                     attestation_provider,
                     config.http_client_factory(),
                 )
+                .with_free_guardian_enabled(config.free_guardian_enabled())
                 .with_prompt_cache_key_override(
                     crate::guardian::prompt_cache_key_override_for_review_session(
                         &session_configuration.session_source,
@@ -1437,6 +1461,7 @@ impl Session {
                 services,
                 git_enrichment_policy,
                 fork_persistence,
+                forked_from_ordinal_exclusive,
                 next_internal_sub_id: AtomicU64::new(0),
             });
             if let Some(network_policy_decider_session) = network_policy_decider_session {

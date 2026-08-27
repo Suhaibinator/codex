@@ -18,6 +18,7 @@ use codex_protocol::config_types::ShellEnvironmentPolicy;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::openai_models::MODEL_SPECIALTY_CYBER;
 use codex_protocol::openai_models::ModelInfo;
+use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::permissions::RawFileSystemSandboxPolicy;
 use codex_protocol::protocol::EnvironmentConfig;
 use codex_protocol::protocol::EnvironmentConfigState;
@@ -104,7 +105,7 @@ impl TurnEnvironment {
     }
 
     pub(crate) fn workspace_roots(&self) -> &[PathUri] {
-        &self.selection.workspace_roots
+        &self.config().workspace_roots
     }
 
     pub(crate) fn permission_profile(&self) -> &PermissionProfile {
@@ -143,14 +144,9 @@ impl TurnEnvironment {
     }
 
     pub(crate) fn permission_profile_with_workspace_roots(&self) -> PermissionProfile {
-        let workspace_roots = self
-            .workspace_roots()
-            .iter()
-            .filter_map(|workspace_root| workspace_root.to_abs_path().ok())
-            .collect::<Vec<_>>();
         self.permission_profile()
             .clone()
-            .materialize_project_roots_with_workspace_roots(&workspace_roots)
+            .materialize_project_roots_with_path_uris(self.workspace_roots())
     }
 
     pub(crate) fn selection(&self) -> TurnEnvironmentSelection {
@@ -165,7 +161,7 @@ impl std::fmt::Debug for TurnEnvironment {
             .field("environment_id", &self.selection.environment_id)
             .field("environment", &self.environment)
             .field("cwd", &self.selection.cwd)
-            .field("workspace_roots", &self.selection.workspace_roots)
+            .field("workspace_roots", &self.config().workspace_roots)
             .field("temporary_directories", &self.temporary_directories)
             .field("shell", &self.shell)
             .field("config", self.config())
@@ -415,9 +411,7 @@ impl TurnContext {
     /// Legacy: returns the frozen initial-turn reasoning effort, including the initial model default.
     /// Step-scoped consumers should use their captured `StepContext::settings`.
     pub(crate) fn effective_reasoning_effort(&self) -> Option<ReasoningEffortConfig> {
-        self.reasoning_effort()
-            .or(self.model_info().default_reasoning_level.as_ref())
-            .cloned()
+        self.initial_settings.effective_reasoning_effort()
     }
 
     /// Legacy: returns the frozen initial-turn reasoning-effort label for tracing.
@@ -732,6 +726,9 @@ impl Session {
 
         let mut per_turn_config = per_turn_config;
         super::token_budget::apply_model_defaults(&mut per_turn_config, model_info);
+        if step_settings.reasoning_effort() == Some(&ReasoningEffort::Persistent) {
+            super::time_reminder::apply_persistent_defaults(&mut per_turn_config);
+        }
         per_turn_config.service_tier = step_settings.service_tier.clone();
         let permission_profile = environments.permission_profile_or_else(|| {
             per_turn_config.permissions.effective_permission_profile()
@@ -837,6 +834,7 @@ impl Session {
                 self.send_event_raw(Event {
                     id: sub_id,
                     msg: EventMsg::Error(ErrorEvent {
+                        misalignment: None,
                         message: message.clone(),
                         codex_error_info: Some(CodexErrorInfo::BadRequest),
                     }),
