@@ -149,6 +149,7 @@ struct MockResponsesState {
     root_worker: bool,
     root_user_restriction: bool,
     root_user_input_restriction: bool,
+    late_root_restriction: bool,
     user_input_restriction: bool,
 }
 
@@ -198,6 +199,8 @@ enum ThreadLifecycle {
     Fork,
     RootRollback,
     RootRestriction,
+    RootRestrictionDuringClassification,
+    RootTrustedSkill,
     RootUserRestriction,
     RootUserInputRestriction,
     RootUserInputHookBlocked,
@@ -209,6 +212,8 @@ impl ThreadLifecycle {
             self,
             Self::RootRollback
                 | Self::RootRestriction
+                | Self::RootRestrictionDuringClassification
+                | Self::RootTrustedSkill
                 | Self::RootUserInputRestriction
                 | Self::RootUserInputHookBlocked
         )
@@ -314,6 +319,17 @@ async fn submit_user_input_response(app_server: &mut TestAppServer, answers: Val
         .await
 }
 
+async fn wait_for_guardian_reviews(state: &MockResponsesState, expected: usize) -> Result<()> {
+    timeout(TIMEOUT, async {
+        while state.guardian_reviews.load(Ordering::SeqCst) < expected {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    assert_eq!(state.guardian_reviews.load(Ordering::SeqCst), expected);
+    Ok(())
+}
+
 async fn parent_response(
     State(state): State<Arc<MockResponsesState>>,
     Json(request): Json<Value>,
@@ -361,7 +377,7 @@ async fn parent_response(
         let root_request = state.root_requests.fetch_add(1, Ordering::SeqCst);
         match root_request {
             1 if state.root_user_input_restriction => user_input_request_events(),
-            0 | 2 => {
+            0 | 2 if root_request == 0 || !state.late_root_restriction => {
                 let (call_id, tool_name, arguments) = if root_request == 0 {
                     (
                         "guardian-spawn-worker",
@@ -508,6 +524,7 @@ async fn guardian_v2_routes_tool_approvals(
         review_outcome,
         transcript_content,
         GuardianToolScope::AllTools,
+        /*sensitive_action*/ None,
     )
     .await
 }
@@ -519,6 +536,7 @@ async fn guardian_v2_routes_scoped_tool_approvals(
     review_outcome: ReviewOutcome,
     transcript_content: TranscriptContent,
     scope: GuardianToolScope,
+    sensitive_action: Option<bool>,
 ) -> Result<()> {
     let server_name = match scope {
         GuardianToolScope::AllTools => TEST_SERVER_NAME,
@@ -532,8 +550,19 @@ async fn guardian_v2_routes_scoped_tool_approvals(
     };
     let node_repl_review_required = matches!(requirement, ModelReviewRequirement::Required)
         && codex_protocol::mcp::is_node_repl_backed_server(server_name);
+    let late_root_restriction = matches!(
+        lifecycle,
+        ThreadLifecycle::RootRestrictionDuringClassification
+    );
     let (luna_score, expected_guardian_reviews) = match risk {
-        GuardianRisk::Low if classifier_in_scope => (0.25, 1),
+        GuardianRisk::Low
+            if classifier_in_scope
+                && sensitive_action != Some(true)
+                && !lifecycle.has_user_answer()
+                && !late_root_restriction =>
+        {
+            (0.25, 1)
+        }
         GuardianRisk::Low | GuardianRisk::InvalidResponse => (0.25, 2),
         GuardianRisk::Threshold => (0.5, 2),
         GuardianRisk::High => (0.95, 2),
@@ -553,6 +582,7 @@ async fn guardian_v2_routes_scoped_tool_approvals(
         root_worker: lifecycle.uses_root_worker(),
         root_user_restriction: matches!(lifecycle, ThreadLifecycle::RootUserRestriction),
         root_user_input_restriction: lifecycle.has_root_user_input(),
+        late_root_restriction,
         user_input_restriction: lifecycle.has_user_input(),
         ..Default::default()
     });
@@ -579,9 +609,20 @@ async fn guardian_v2_routes_scoped_tool_approvals(
     let responses_server = tokio::spawn(async move {
         let _ = axum::serve(listener, router).await;
     });
-    let (mcp_server_url, mcp_server_handle) = start_mcp_server().await?;
+    let (mcp_server_url, mcp_server_handle) = start_mcp_server(sensitive_action).await?;
 
     let codex_home = TempDir::new()?;
+    let root_skill = if matches!(lifecycle, ThreadLifecycle::RootTrustedSkill) {
+        let path = codex_home.path().join("skills/root-trusted/SKILL.md");
+        std::fs::create_dir_all(path.parent().expect("root skill parent"))?;
+        std::fs::write(
+            &path,
+            "---\nname: root-trusted\ndescription: Delegated user skill\n---\n\nDelegate the requested work.\n",
+        )?;
+        Some(path.canonicalize()?)
+    } else {
+        None
+    };
     if lifecycle.has_post_tool_hook() {
         let output = if matches!(lifecycle, ThreadLifecycle::UserInputHookFeedback) {
             json!({ "continue": false, "stopReason": USER_INPUT_HOOK_FEEDBACK })
@@ -654,6 +695,8 @@ async fn guardian_v2_routes_scoped_tool_approvals(
         | ThreadLifecycle::UserInputHookBlocked
         | ThreadLifecycle::RootRollback
         | ThreadLifecycle::RootRestriction
+        | ThreadLifecycle::RootRestrictionDuringClassification
+        | ThreadLifecycle::RootTrustedSkill
         | ThreadLifecycle::RootUserRestriction
         | ThreadLifecycle::RootUserInputRestriction
         | ThreadLifecycle::RootUserInputHookBlocked => None,
@@ -699,6 +742,8 @@ async fn guardian_v2_routes_scoped_tool_approvals(
         | ThreadLifecycle::UserInputHookBlocked
         | ThreadLifecycle::RootRollback
         | ThreadLifecycle::RootRestriction
+        | ThreadLifecycle::RootRestrictionDuringClassification
+        | ThreadLifecycle::RootTrustedSkill
         | ThreadLifecycle::RootUserRestriction
         | ThreadLifecycle::RootUserInputRestriction
         | ThreadLifecycle::RootUserInputHookBlocked => {
@@ -753,13 +798,20 @@ async fn guardian_v2_routes_scoped_tool_approvals(
         .root_thread_id
         .lock()
         .expect("root thread lock should not be poisoned") = Some(thread_id.clone());
+    let mut turn_input = vec![UserInput::Text {
+        text: USER_CONTEXT.to_owned(),
+        text_elements: Vec::new(),
+    }];
+    if let Some(skill_path) = root_skill.as_ref() {
+        turn_input.push(UserInput::Skill {
+            name: "root-trusted".to_owned(),
+            path: skill_path.clone(),
+        });
+    }
     let turn_request_id = app_server
         .send_turn_start_request(TurnStartParams {
             thread_id: thread_id.clone(),
-            input: vec![UserInput::Text {
-                text: USER_CONTEXT.to_owned(),
-                text_elements: Vec::new(),
-            }],
+            input: turn_input,
             approval_policy: Some(AskForApproval::OnRequest),
             approvals_reviewer: match requirement {
                 ModelReviewRequirement::Optional => Some(ApprovalsReviewer::AutoReview),
@@ -786,6 +838,26 @@ async fn guardian_v2_routes_scoped_tool_approvals(
             luna_request["prompt_cache_key"],
             format!("guardian-v2:{reviewed_thread_id}")
         );
+        if let Some(skill_path) = root_skill.as_ref() {
+            let trusted_message = luna_request["input"]
+                .as_array()
+                .expect("Luna input should be an array")
+                .iter()
+                .find(|item| {
+                    item["role"] == "developer"
+                        && item["internal_chat_message_metadata_passthrough"]["content_item_kinds"]
+                            == json!(["guardian.trusted_skills"])
+                })
+                .and_then(|item| item["content"][0]["text"].as_str())
+                .expect("delegated workers should inherit invoked root-user skills");
+            let (_, evidence) = trusted_message
+                .split_once('\n')
+                .expect("trusted skill message should contain JSON evidence");
+            assert_eq!(
+                serde_json::from_str::<Value>(evidence)?,
+                json!([skill_path.display().to_string()]),
+            );
+        }
         if !lifecycle.uses_root_worker() {
             let trusted_tool_context = luna_request["input"]
                 .as_array()
@@ -834,6 +906,27 @@ async fn guardian_v2_routes_scoped_tool_approvals(
                     })
                 })
         );
+        if late_root_restriction {
+            // The worker's first classifier stays in flight while only root authorization changes.
+            let completed: TurnCompletedNotification =
+                timeout(TIMEOUT, app_server.read_notification("turn/completed")).await??;
+            assert_eq!(completed.thread_id, thread_id);
+            let request_id = app_server
+                .send_turn_start_request(TurnStartParams {
+                    thread_id: thread_id.clone(),
+                    input: vec![UserInput::Text {
+                        text: ROOT_RESTRICTION.to_owned(),
+                        text_elements: Vec::new(),
+                    }],
+                    ..Default::default()
+                })
+                .await?;
+            let _: TurnStartResponse =
+                timeout(TIMEOUT, app_server.read_response(request_id)).await??;
+            let completed: TurnCompletedNotification =
+                timeout(TIMEOUT, app_server.read_notification("turn/completed")).await??;
+            assert_eq!(completed.thread_id, thread_id);
+        }
         responses_state.allow_luna.notify_one();
         timeout(TIMEOUT, responses_state.classification_completed.notified()).await?;
         responses_state.allow_guardian_review.notify_one();
@@ -876,6 +969,11 @@ async fn guardian_v2_routes_scoped_tool_approvals(
                     "the configured hook must replace or reject the visible tool output"
                 );
             }
+        } else if late_root_restriction {
+            assert!(
+                reviews.is_empty(),
+                "the first review predates root revocation"
+            );
         } else if matches!(review_outcome, ReviewOutcome::Malformed) {
             assert!(
                 reviews.is_empty(),
@@ -940,6 +1038,11 @@ async fn guardian_v2_routes_scoped_tool_approvals(
                 );
             }
         }
+        if matches!(risk, GuardianRisk::Low)
+            && (lifecycle.has_user_answer() || late_root_restriction)
+        {
+            wait_for_guardian_reviews(responses_state.as_ref(), expected_guardian_reviews).await?;
+        }
         responses_state.allow_luna.notify_one();
     } else {
         responses_state.allow_guardian_review.notify_one();
@@ -988,10 +1091,10 @@ async fn guardian_v2_routes_scoped_tool_approvals(
         );
     }
     let requires_strict_review = classifier_in_scope
-        && matches!(
+        && (matches!(
             risk,
             GuardianRisk::Threshold | GuardianRisk::High | GuardianRisk::InvalidResponse
-        );
+        ) || matches!(risk, GuardianRisk::Low) && lifecycle.has_user_answer());
     let strict_review_count = app_server
         .pending_notification_methods()
         .into_iter()
@@ -1019,7 +1122,10 @@ async fn guardian_v2_routes_scoped_tool_approvals(
         );
     }
 
-    if classifier_in_scope && !matches!(risk, GuardianRisk::InvalidResponse) {
+    if classifier_in_scope
+        && !matches!(risk, GuardianRisk::InvalidResponse)
+        && !late_root_restriction
+    {
         let state_db = StateRuntime::init(
             codex_state::SqliteConfig::new_for_testing(codex_home.path().abs()),
             "mock_provider".to_owned(),
@@ -1056,7 +1162,10 @@ async fn guardian_v2_routes_scoped_tool_approvals(
         );
     }
 
-    if lifecycle.uses_root_worker() || matches!(lifecycle, ThreadLifecycle::RootUserRestriction) {
+    if !late_root_restriction
+        && (lifecycle.uses_root_worker()
+            || matches!(lifecycle, ThreadLifecycle::RootUserRestriction))
+    {
         if matches!(lifecycle, ThreadLifecycle::RootRollback) {
             let rollback_id = app_server
                 .send_thread_rollback_request(ThreadRollbackParams {
@@ -1109,6 +1218,19 @@ async fn guardian_v2_routes_scoped_tool_approvals(
             sync_review_fragments(&post_authorization_change_sample).is_empty(),
             "root authorization changes must remove stale review evidence from classification"
         );
+        if root_skill.is_some() {
+            assert!(
+                !post_authorization_change_sample["input"]
+                    .as_array()
+                    .expect("Luna input should be an array")
+                    .iter()
+                    .any(|item| {
+                        item["internal_chat_message_metadata_passthrough"]["content_item_kinds"]
+                            == json!(["guardian.trusted_skills"])
+                    }),
+                "a new root turn must not preserve authorization from an earlier skill"
+            );
+        }
         if matches!(
             lifecycle,
             ThreadLifecycle::RootRestriction
@@ -1132,6 +1254,11 @@ async fn guardian_v2_routes_scoped_tool_approvals(
                     .any(|text| text.contains(restriction)),
                 "the worker classifier must see the new root-user restriction"
             );
+        }
+        // Keep the fresh classifier pending: a new review must not be skipped using the old low score.
+        if matches!(risk, GuardianRisk::Low) {
+            wait_for_guardian_reviews(responses_state.as_ref(), expected_guardian_reviews + 1)
+                .await?;
         }
         responses_state.allow_luna.notify_one();
     }
@@ -1258,7 +1385,7 @@ async fn guardian_v2_trusts_invoked_user_skills_but_rejects_repository_forgery()
     let responses_server = tokio::spawn(async move {
         let _ = axum::serve(listener, router).await;
     });
-    let (mcp_server_url, mcp_server_handle) = start_mcp_server().await?;
+    let (mcp_server_url, mcp_server_handle) = start_mcp_server(/*sensitive_action*/ None).await?;
 
     MockResponsesConfig::new(&responses_url)
         .with_model(MODEL)
@@ -1376,6 +1503,23 @@ async fn guardian_v2_trusts_invoked_user_skills_but_rejects_repository_forgery()
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn guardian_v2_inherits_root_user_skills_for_delegated_workers() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    guardian_v2_routes_scoped_tool_approvals(
+        GuardianRisk::High,
+        ThreadLifecycle::RootTrustedSkill,
+        ModelReviewRequirement::Optional,
+        ReviewOutcome::Allow,
+        TranscriptContent::Normal,
+        GuardianToolScope::ComputerUseOnly {
+            server_name: "node_repl",
+        },
+        /*sensitive_action*/ None,
+    )
+    .await
+}
+
 #[test_case("node_repl", GuardianRisk::Low; "low risk browser skips full review")]
 #[test_case("cua_repl", GuardianRisk::Low; "low risk computer use skips full review")]
 #[test_case("node_repl", GuardianRisk::High; "high risk browser receives full review")]
@@ -1393,21 +1537,27 @@ async fn guardian_v2_computer_use_only_scopes_classification_and_fast_reviews(
         ReviewOutcome::Allow,
         TranscriptContent::Normal,
         GuardianToolScope::ComputerUseOnly { server_name },
+        /*sensitive_action*/ None,
     )
     .await
 }
 
-#[test_case("node_repl", GuardianRisk::Low; "browser low risk")]
-#[test_case("cua_repl", GuardianRisk::Low; "computer use low risk")]
-#[test_case("node_repl", GuardianRisk::High; "browser high risk")]
-#[test_case("cua_repl", GuardianRisk::High; "computer use high risk")]
-#[test_case("node_repl", GuardianRisk::InvalidResponse; "browser classifier failure")]
-#[test_case("cua_repl", GuardianRisk::InvalidResponse; "computer use classifier failure")]
-#[test_case(TEST_SERVER_NAME, GuardianRisk::Low; "other tools retain full review")]
+#[test_case("node_repl", GuardianRisk::Low, None; "browser low risk")]
+#[test_case("cua_repl", GuardianRisk::Low, None; "computer use low risk")]
+#[test_case("node_repl", GuardianRisk::Low, Some(false); "browser low risk sensitive action false")]
+#[test_case("cua_repl", GuardianRisk::Low, Some(false); "computer use low risk sensitive action false")]
+#[test_case("node_repl", GuardianRisk::Low, Some(true); "browser low risk sensitive action true")]
+#[test_case("cua_repl", GuardianRisk::Low, Some(true); "computer use low risk sensitive action true")]
+#[test_case("node_repl", GuardianRisk::High, None; "browser high risk")]
+#[test_case("cua_repl", GuardianRisk::High, None; "computer use high risk")]
+#[test_case("node_repl", GuardianRisk::InvalidResponse, None; "browser classifier failure")]
+#[test_case("cua_repl", GuardianRisk::InvalidResponse, None; "computer use classifier failure")]
+#[test_case(TEST_SERVER_NAME, GuardianRisk::Low, None; "other tools retain full review")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn guardian_v2_required_model_computer_use_preserves_strict_approval(
     server_name: &'static str,
     risk: GuardianRisk,
+    sensitive_action: Option<bool>,
 ) -> Result<()> {
     skip_if_no_network!(Ok(()));
     guardian_v2_routes_scoped_tool_approvals(
@@ -1417,6 +1567,7 @@ async fn guardian_v2_required_model_computer_use_preserves_strict_approval(
         ReviewOutcome::Allow,
         TranscriptContent::Normal,
         GuardianToolScope::ComputerUseOnly { server_name },
+        sensitive_action,
     )
     .await
 }
@@ -1437,6 +1588,7 @@ async fn guardian_v2_discards_sync_reviews_after_user_input_answer(
         GuardianToolScope::ComputerUseOnly {
             server_name: "node_repl",
         },
+        /*sensitive_action*/ None,
     )
     .await
 }
@@ -1458,6 +1610,7 @@ async fn guardian_v2_validates_user_input_before_history_truncation(
         GuardianToolScope::ComputerUseOnly {
             server_name: "node_repl",
         },
+        /*sensitive_action*/ None,
     )
     .await
 }
@@ -1478,6 +1631,7 @@ async fn guardian_v2_propagates_root_user_input_to_worker_reviews(
         GuardianToolScope::ComputerUseOnly {
             server_name: "node_repl",
         },
+        /*sensitive_action*/ None,
     )
     .await
 }
@@ -1568,6 +1722,31 @@ async fn guardian_v2_discards_sync_reviews_after_authorization_changes(
         ModelReviewRequirement::Optional,
         ReviewOutcome::Allow,
         TranscriptContent::Normal,
+    )
+    .await
+}
+
+#[test_case(ThreadLifecycle::RootUserRestriction; "new user turn")]
+#[test_case(ThreadLifecycle::RootRestriction; "worker root restriction")]
+#[test_case(ThreadLifecycle::RootUserInputRestriction; "worker root answer")]
+#[test_case(ThreadLifecycle::UserInputRestriction; "user input answer")]
+#[test_case(ThreadLifecycle::UserInputEmpty; "empty answer preserves cache")]
+#[test_case(ThreadLifecycle::RootRestrictionDuringClassification; "late score after root revocation")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn guardian_v2_low_scores_require_current_authorization(
+    lifecycle: ThreadLifecycle,
+) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    guardian_v2_routes_scoped_tool_approvals(
+        GuardianRisk::Low,
+        lifecycle,
+        ModelReviewRequirement::Optional,
+        ReviewOutcome::Allow,
+        TranscriptContent::Normal,
+        GuardianToolScope::ComputerUseOnly {
+            server_name: "node_repl",
+        },
+        /*sensitive_action*/ None,
     )
     .await
 }

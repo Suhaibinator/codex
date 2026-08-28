@@ -798,6 +798,38 @@ impl UnifiedExecProcessManager {
         };
         let _interaction_guard = locked_process.interaction_lock().lock_owned().await;
         if let Some(approval) = approval {
+            let approval_reason = "Send input to an existing escalated terminal. The cwd is its launch directory; the terminal's current directory and state may have changed.".to_string();
+            let reviewed = crate::guardian::format_guardian_action_pretty(
+                &approval.clone().into_guardian_request().map_err(|err| {
+                    UnifiedExecError::StdinApproval(ToolError::Rejected(err.to_string()))
+                })?,
+            )
+            .map_err(|err| UnifiedExecError::StdinApproval(ToolError::Rejected(err.to_string())))?;
+            // Bound the entire serialized action plus its reason, including JSON
+            // escaping. Reject, never execute an unreviewed tail.
+            let oversized = reviewed.text.len().saturating_add(approval_reason.len()) > 8_000;
+            let size_check_result = if reviewed.truncated {
+                "formatter_truncated"
+            } else if oversized {
+                "over_limit"
+            } else {
+                "within_limit"
+            };
+            let input_kind = if request.input.chars().all(char::is_control) {
+                "control"
+            } else {
+                "text"
+            };
+            context.step_context.session_telemetry.counter(
+                "codex.unified_exec.stdin_review.size_check",
+                /*inc*/ 1,
+                &[("result", size_check_result), ("input_kind", input_kind)],
+            );
+            if reviewed.truncated || oversized {
+                return Err(UnifiedExecError::StdinApproval(ToolError::Rejected(
+                    "terminal input and permission details are too large to review safely; use a smaller input or start a new terminal with fewer grants".to_string(),
+                )));
+            }
             let strict_auto_review = context
                 .session
                 .active_turn_context_and_strict_auto_review()
@@ -809,7 +841,7 @@ impl UnifiedExecProcessManager {
                 call_id: context.call_id.clone(),
                 tool_name: ToolName::plain("write_stdin"),
                 strict_auto_review,
-                approval_reason: Some("Send input to an existing escalated terminal. The cwd is its launch directory; the terminal's current directory and state may have changed.".to_string()),
+                approval_reason: Some(approval_reason),
                 retry_reason: None,
                 network_approval_context: None,
             };

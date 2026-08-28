@@ -4127,6 +4127,20 @@ plugins = true
         vec!["other-mcp".to_string(), "sample-mcp".to_string()]
     );
     assert!(api_key_outcome.plugin.apps.is_empty());
+
+    let no_auth_outcome = test_plugins_manager_with_options(
+        tmp.path().to_path_buf(),
+        Some(Product::Codex),
+        /*auth_mode*/ None,
+    )
+    .read_plugin_for_config(&config, &request)
+    .await
+    .unwrap();
+    assert_eq!(
+        no_auth_outcome.plugin.mcp_server_names,
+        vec!["other-mcp".to_string(), "sample-mcp".to_string()]
+    );
+    assert!(no_auth_outcome.plugin.apps.is_empty());
 }
 
 #[tokio::test]
@@ -4166,7 +4180,11 @@ plugins = true
     );
 
     let config = load_config(tmp.path(), &repo_root).await;
-    let manager = test_plugins_manager(tmp.path().to_path_buf());
+    let manager = test_plugins_manager_with_options(
+        tmp.path().to_path_buf(),
+        Some(Product::Codex),
+        Some(AuthMode::Chatgpt),
+    );
     let outcome = manager
         .read_plugin_for_config(
             &config,
@@ -4606,19 +4624,23 @@ enabled = false
     );
 
     let config = load_config(tmp.path(), &repo_root).await;
-    let outcome = test_plugins_manager(tmp.path().to_path_buf())
-        .read_plugin_for_config(
-            &config,
-            &PluginReadRequest {
-                plugin_name: "toolkit".to_string(),
-                marketplace_path: AbsolutePathBuf::try_from(
-                    repo_root.join(".agents/plugins/marketplace.json"),
-                )
-                .unwrap(),
-            },
-        )
-        .await
-        .unwrap();
+    let outcome = test_plugins_manager_with_options(
+        tmp.path().to_path_buf(),
+        Some(Product::Codex),
+        Some(AuthMode::Chatgpt),
+    )
+    .read_plugin_for_config(
+        &config,
+        &PluginReadRequest {
+            plugin_name: "toolkit".to_string(),
+            marketplace_path: AbsolutePathBuf::try_from(
+                repo_root.join(".agents/plugins/marketplace.json"),
+            )
+            .unwrap(),
+        },
+    )
+    .await
+    .unwrap();
 
     assert_eq!(outcome.plugin.details_unavailable_reason, None);
     assert_eq!(
@@ -6364,25 +6386,39 @@ enabled = true
 "#,
     );
     let config = load_plugins_config_input(codex_home.path(), &marketplace_root).await;
-    let roots = [AbsolutePathBuf::try_from(marketplace_root.clone()).unwrap()];
+    let context = PluginMarketplaceContext {
+        global_config: config.clone(),
+        scopes: vec![PluginMarketplaceScope {
+            cwd: Some(AbsolutePathBuf::try_from(marketplace_root.clone()).unwrap()),
+            config,
+        }],
+        load_errors: Vec::new(),
+    };
     let manager = Arc::new(test_plugins_manager(codex_home.path().to_path_buf()));
     manager
         .non_curated_cache_refresh_state
         .write()
         .expect("refresh state lock")
         .in_flight = true;
+    let marketplaces = manager
+        .list_marketplaces_for_context(&context, /*include_openai_curated*/ false)
+        .unwrap()
+        .marketplaces;
 
     for git_mode in [
         PluginGitMode::Automatic,
         PluginGitMode::Manual,
         PluginGitMode::Automatic,
     ] {
-        manager.schedule_non_curated_plugin_cache_refresh(
-            &config,
-            &roots,
-            NonCuratedCacheRefreshMode::IfVersionChanged,
-            git_mode,
-        );
+        let request = context
+            .non_curated_cache_refresh_request(
+                &manager,
+                &marketplaces,
+                NonCuratedCacheRefreshMode::IfVersionChanged,
+                git_mode,
+            )
+            .expect("refresh request");
+        manager.schedule_non_curated_plugin_cache_refresh(request);
     }
 
     {
@@ -6398,7 +6434,7 @@ enabled = true
         state.in_flight = false;
     }
 
-    manager.maybe_start_non_curated_plugin_cache_refresh(&config, &roots);
+    manager.maybe_start_non_curated_plugin_cache_refresh(&context, &marketplaces);
 
     {
         let mut state = manager
@@ -6417,7 +6453,11 @@ enabled = true
         "sample-plugin",
         Some("2.0.0"),
     );
-    manager.maybe_start_non_curated_plugin_cache_refresh(&config, &roots);
+    let marketplaces = manager
+        .list_marketplaces_for_context(&context, /*include_openai_curated*/ false)
+        .unwrap()
+        .marketplaces;
+    manager.maybe_start_non_curated_plugin_cache_refresh(&context, &marketplaces);
 
     let state = manager
         .non_curated_cache_refresh_state
@@ -6962,6 +7002,7 @@ fn remote_installed_plugins_cache_refresh_coalesces_materializations() {
         scope: crate::remote::RemotePluginScope::Workspace,
         discoverability: Some(crate::remote::RemotePluginShareDiscoverability::Listed),
         authenticated_account_id: Some("account-123".to_string()),
+        capabilities: Default::default(),
     };
     let change = |name: &str| EffectivePluginsChange {
         materialized_remote_plugins: vec![materialization(name)],

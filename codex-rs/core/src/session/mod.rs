@@ -1800,6 +1800,7 @@ impl Session {
             config.tool_suggest =
                 resolve_tool_suggest_config_from_layer_stack(&config.config_layer_stack);
             config.mcp_servers = next_config.mcp_servers.clone();
+            config.mcp_optional_startup_grace = next_config.mcp_optional_startup_grace;
             config.mcp_oauth_credentials_store_mode = next_config.mcp_oauth_credentials_store_mode;
             if let Err(err) = config.features.set_enabled(
                 Feature::SecretAuthStorage,
@@ -1847,6 +1848,7 @@ impl Session {
             .config_layer_stack
             .with_user_layer_from(&config.config_layer_stack);
         config.mcp_servers = next_config.mcp_servers;
+        config.mcp_optional_startup_grace = next_config.mcp_optional_startup_grace;
         config.mcp_oauth_credentials_store_mode = next_config.mcp_oauth_credentials_store_mode;
         if let Err(err) = config.features.set_enabled(
             Feature::SecretAuthStorage,
@@ -3319,6 +3321,11 @@ impl Session {
         // Capture once before asynchronous planning; all request consumers
         // retain this immutable settings version even if the turn is updated.
         let settings = turn_context.current_settings.load_full();
+        let token_budget = token_budget::resolve_token_budget(
+            turn_context.configured_token_budget.as_ref(),
+            turn_context.use_model_token_budget_defaults,
+            settings.model_info.as_ref(),
+        );
         let session_telemetry = settings.telemetry(&turn_context.session_telemetry);
         // Keep selections fixed for the turn while allowing their startup work to finish.
         let environments = turn_context.environments.refresh_readiness();
@@ -3393,6 +3400,8 @@ impl Session {
         let tool_router = turn::built_tools(
             self.as_ref(),
             turn_context.as_ref(),
+            // TODO(CDXENT-441): use the step scoped model
+            turn_context.model_info(),
             &environments,
             &mcp,
             &extension_data,
@@ -3400,8 +3409,24 @@ impl Session {
         )
         .or_cancel(cancellation_token)
         .await??;
+        // Publish inventory after planning rather than during finalization, so constructing
+        // additional candidate plans cannot overwrite turn-wide metadata.
+        if turn_context
+            .config
+            .tool_registry
+            .turn_metadata_includes_tool_info
+            && turn_context.model_info().use_responses_lite
+        {
+            turn_context.turn_metadata_state.set_tool_namespaces_info(
+                tool_router
+                    .tool_namespaces_info()
+                    .cloned()
+                    .unwrap_or_default(),
+            );
+        }
         Ok(Arc::new(StepContext {
             settings,
+            token_budget,
             session_telemetry,
             turn: turn_context,
             environments,

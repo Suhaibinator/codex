@@ -1,6 +1,7 @@
 use crate::agent::AgentStatus;
 use crate::config::ConstraintResult;
 use crate::context::ContextualUserFragment;
+use crate::context::GuardianReviewEvidence;
 use crate::elicitation::ElicitationRegistration;
 use crate::session::SessionIo;
 use crate::session::SessionSettingsUpdate;
@@ -205,6 +206,7 @@ impl GuardianAuthorizationVersion {
 pub struct GuardianRootSnapshot {
     pub authorization_version: GuardianAuthorizationVersion,
     pub messages: Vec<GuardianRootMessage>,
+    pub trusted_skill_paths: Vec<String>,
 }
 
 pub struct CodexThread {
@@ -805,6 +807,17 @@ impl CodexThread {
 
     pub fn multi_agent_version(&self) -> Option<MultiAgentVersion> {
         self.session.multi_agent_version()
+    }
+
+    /// Returns the current history generation and genuine user-input counts for Guardian.
+    pub async fn guardian_authorization_version(&self) -> GuardianAuthorizationVersion {
+        let history = self.session.conversation_history_snapshot().await;
+        self.thread_extension_data()
+            .get::<GuardianReviewEvidence>()
+            .map_or_else(
+                || GuardianAuthorizationVersion::from_history(history.as_ref()),
+                |evidence| evidence.authorization_version(history.as_ref()),
+            )
     }
 
     /// Returns bounded root conversation evidence and its authorization version atomically.

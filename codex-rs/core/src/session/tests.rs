@@ -70,6 +70,7 @@ use codex_protocol::models::ImageDetail;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::SandboxEnforcement;
 use codex_protocol::openai_models::ModelServiceTier;
+use codex_protocol::openai_models::ToolMode;
 use codex_protocol::permissions::FileSystemAccessMode;
 use codex_protocol::permissions::FileSystemPath;
 use codex_protocol::permissions::FileSystemSandboxEntry;
@@ -240,6 +241,11 @@ impl StepContext {
         });
         settings.service_tier = turn.config.service_tier.clone();
         Arc::new(Self {
+            token_budget: token_budget::resolve_token_budget(
+                turn.configured_token_budget.as_ref(),
+                turn.use_model_token_budget_defaults,
+                settings.model_info.as_ref(),
+            ),
             settings: Arc::new(settings),
             session_telemetry: turn.session_telemetry.clone(),
             turn: Arc::clone(&turn),
@@ -252,6 +258,10 @@ impl StepContext {
             tool_router: Arc::new(ToolRouter::from_parts(
                 ToolRegistry::empty_for_test(),
                 Vec::new(),
+                ToolMode::Direct,
+                BTreeMap::new(),
+                /*tool_namespaces_info*/ None,
+                &[],
             )),
             loaded_agents_md: None,
         })
@@ -872,6 +882,7 @@ pub(crate) fn tool_registry_for_test_step(
 ) -> (ToolRegistry, Vec<ToolSpec>) {
     let mut registry = crate::tools::spec_plan::build_core_tool_registry(
         step_context.turn.as_ref(),
+        step_context.turn.model_info(),
         &step_context.environments,
         step_context.mcp.as_ref(),
         /*tool_suggest_candidates*/ None,
@@ -879,6 +890,7 @@ pub(crate) fn tool_registry_for_test_step(
     );
     let hosted_specs = crate::tools::spec_plan::append_source_tools(
         step_context.turn.as_ref(),
+        step_context.turn.model_info(),
         &mut registry,
         Vec::new(),
         Vec::new(),
@@ -892,6 +904,7 @@ fn test_tool_runtime(session: Arc<Session>, turn_context: Arc<TurnContext>) -> T
     let (registry, hosted_specs) = tool_registry_for_test_step(step_context.as_ref());
     let router = Arc::new(ToolRouter::from_registry(
         step_context.turn.as_ref(),
+        step_context.turn.model_info(),
         registry,
         hosted_specs,
         &Default::default(),
@@ -6336,10 +6349,11 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
             /*attestation_provider*/ None,
             config.http_client_factory(),
         ),
-        executed_tool_calls,
+        executed_tool_calls: executed_tool_calls.clone(),
         code_mode_service: crate::tools::code_mode::CodeModeService::new(
             Arc::new(codex_code_mode::DisabledCodeModeSessionProvider),
             &config.code_mode,
+            executed_tool_calls,
         ),
         tool_search_handler_cache: Default::default(),
         turn_environments: Arc::clone(&turn_environments),
@@ -8614,10 +8628,11 @@ where
             /*attestation_provider*/ None,
             config.http_client_factory(),
         ),
-        executed_tool_calls,
+        executed_tool_calls: executed_tool_calls.clone(),
         code_mode_service: crate::tools::code_mode::CodeModeService::new(
             Arc::new(codex_code_mode::DisabledCodeModeSessionProvider),
             &config.code_mode,
+            executed_tool_calls,
         ),
         tool_search_handler_cache: Default::default(),
         turn_environments: Arc::clone(&turn_environments),
@@ -9282,6 +9297,7 @@ async fn capability_discovery_uses_environment_permission_profile() {
         permissions: environment.permission_profile().clone().into(),
         cwd: Some(environment.cwd().clone()),
         workspace_roots: environment.workspace_roots().to_vec(),
+        user_home_dir: environment.user_home_dir.clone(),
         temporary_directories: environment.temporary_directories.clone(),
         windows_sandbox_level: WindowsSandboxLevel::Elevated,
         windows_sandbox_private_desktop: false,
@@ -11605,6 +11621,7 @@ async fn fatal_tool_error_stops_turn_and_reports_error() {
     let (registry, hosted_specs) = tool_registry_for_test_step(step_context.as_ref());
     let router = ToolRouter::from_registry(
         step_context.turn.as_ref(),
+        step_context.turn.model_info(),
         registry,
         hosted_specs,
         &Default::default(),

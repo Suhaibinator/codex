@@ -266,7 +266,9 @@ impl ApprovalAction {
         }
     }
 
-    fn into_guardian_request(self) -> std::io::Result<crate::guardian::GuardianApprovalRequest> {
+    pub(crate) fn into_guardian_request(
+        self,
+    ) -> std::io::Result<crate::guardian::GuardianApprovalRequest> {
         Ok(match self {
             Self::ExecCommand {
                 id,
@@ -631,6 +633,7 @@ impl Session {
                     plugin_attribution_override: None,
                     approval_request_source: GuardianApprovalRequestSource::MainTurn,
                     external_cancel: Some(cancellation_token.clone()),
+                    require_synchronous_review: false,
                 },
             );
             review.await.unwrap_or_else(|_| {
@@ -653,6 +656,7 @@ impl Session {
                         plugin_attribution_override: None,
                         approval_request_source: GuardianApprovalRequestSource::MainTurn,
                         external_cancel: Some(review_cancel),
+                        require_synchronous_review: false,
                     },
                 )
                 .await
