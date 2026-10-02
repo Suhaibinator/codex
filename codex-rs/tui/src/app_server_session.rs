@@ -7,6 +7,10 @@ mod fs;
 mod history;
 mod rollout_history;
 
+#[cfg(test)]
+#[path = "app_server_session/turn_tests.rs"]
+mod turn_tests;
+
 pub(crate) use history::HISTORY_ITEM_PAGE_LIMIT;
 pub(crate) use history::HISTORY_ITEM_SCAN_LIMIT;
 pub(crate) use history::HistoryHydrationScope;
@@ -35,6 +39,7 @@ use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::ConfigBatchWriteParams;
 use codex_app_server_protocol::ConfigRequirementsReadResponse;
 use codex_app_server_protocol::ConfigWriteResponse;
+use codex_app_server_protocol::CyberAccessProgram;
 use codex_app_server_protocol::ExternalAgentConfigDetectParams;
 use codex_app_server_protocol::ExternalAgentConfigDetectResponse;
 use codex_app_server_protocol::ExternalAgentConfigImportParams;
@@ -1227,7 +1232,7 @@ impl AppServerSession {
                     output_schema,
                     collaboration_mode,
                     multi_agent_mode: None,
-                    cyber_access_program: None,
+                    cyber_access_program: Some(CyberAccessProgram::DaybreakBlue),
                 },
             })
             .await
